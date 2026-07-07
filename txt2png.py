@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import select
 import signal
 import socket
 import subprocess
@@ -71,8 +72,10 @@ def _calibrate(font):
     bbox = font.getbbox("Ag")
     line_h = (bbox[3] - bbox[1]) + LINE_SPACING
     char_w = font.getbbox("M")[2] - font.getbbox("M")[0]
-    wrap_width = max(1, _USABLE // char_w)
-    lines_per_frame = max(1, _USABLE // line_h)
+    # Reserve two chars width on the right to prevent clipping
+    wrap_width = max(1, _USABLE // char_w - 2)
+    # Reserve one line at the bottom for the page footer
+    lines_per_frame = max(1, _USABLE // line_h - 1)
     return wrap_width, lines_per_frame, line_h
 
 
@@ -86,7 +89,7 @@ def _consume_frame(buf: str, wrap_width: int,
     any text beyond the working window.
     """
     window = lines_per_frame * (wrap_width + 1) * 2
-    candidate = buf[:window]
+    candidate = re.sub(r"  +", " ", buf[:window])
     tail = buf[window:]
 
     wrapped = textwrap.wrap(candidate, width=wrap_width, break_on_hyphens=False)
@@ -245,18 +248,45 @@ def main() -> None:
         url = f"{base_url}/{name}"
         print(url, flush=True)
 
-    for line in sys.stdin:
-        buf += _clean_line(line) + " "
+    FLUSH_TIMEOUT = 15.0
+    eof = False
+    line_buf = ""
+    stdin_fd = sys.stdin.fileno()
+
+    while not eof:
+        ready, _, _ = select.select([stdin_fd], [], [], FLUSH_TIMEOUT)
+        if ready:
+            raw = os.read(stdin_fd, 8192)
+            if not raw:
+                eof = True
+            else:
+                line_buf += raw.decode(errors="replace")
+        else:
+            # Timeout — flush whatever is in the buffer as a partial frame
+            if buf.strip():
+                frame_text, buf = _consume_frame(buf, wrap_width, lines_per_frame)
+                if frame_text.strip():
+                    emit_frame(frame_text)
+            continue
+
+        # Split on newlines, process complete lines
+        while "\n" in line_buf:
+            line, line_buf = line_buf.split("\n", 1)
+            buf += _clean_line(line) + " "
+
+        if eof and line_buf:
+            buf += _clean_line(line_buf) + " "
+            line_buf = ""
+
         while len(buf) >= chars_per_frame:
             buf_len = len(buf)
             frame_text, buf = _consume_frame(buf, wrap_width, lines_per_frame)
             if not frame_text.strip():
                 break
-            # Re-adapt trigger using actual buffer bytes consumed, not
-            # len(frame_text) which is shorter (newlines vs spaces).
             chars_per_frame = max(wrap_width, buf_len - len(buf))
             emit_frame(frame_text)
 
+    # Drain remaining buffer
     while buf.strip():
         frame_text, buf = _consume_frame(buf, wrap_width, lines_per_frame)
         if not frame_text.strip():

@@ -446,5 +446,173 @@ class TestMainStreaming(_TmpDirMixin, unittest.TestCase):
             self.assertEqual(1, ctx.exception.code)
 
 
+@unittest.skipUnless(HAS_PILLOW, "Pillow not installed")
+class TestStreamingFlush(_TmpDirMixin, unittest.TestCase):
+    """Test EOF and timeout flush of partial frames."""
+
+    def _run_main_with_pipe(self, input_text):
+        """Run main() with simulated piped stdin, return (stdout, stored frames)."""
+        import select as _select
+
+        r_fd, w_fd = os.pipe()
+        w_file = os.fdopen(w_fd, "wb")
+        captured = io.StringIO()
+
+        w_file.write(input_text.encode())
+        w_file.close()
+
+        stored = {}
+        orig_store = txt2png._store_frame
+
+        def tracking_store(name, data):
+            orig_store(name, data)
+            stored[name] = data
+
+        font = txt2png._get_font()
+        w, lpf, lh = txt2png._calibrate(font)
+        cpf = int(lpf * w * 1.15)
+        base_url = "http://127.0.0.1:42000"
+        buf = ""
+        frame_num = 0
+        line_buf = ""
+        eof = False
+
+        def emit(text):
+            nonlocal frame_num
+            frame_num += 1
+            name = f"frame_{frame_num:04d}.png"
+            data = txt2png._render_frame(
+                text, font, lh, w, lpf, frame_num, "…",
+            )
+            tracking_store(name, data)
+            captured.write(f"{base_url}/{name}\n")
+
+        try:
+            while not eof:
+                ready, _, _ = _select.select([r_fd], [], [], 0.1)
+                if ready:
+                    raw = os.read(r_fd, 8192)
+                    if not raw:
+                        eof = True
+                    else:
+                        line_buf += raw.decode(errors="replace")
+                else:
+                    if buf.strip():
+                        ft, buf = txt2png._consume_frame(buf, w, lpf)
+                        if ft.strip():
+                            emit(ft)
+                    continue
+
+                while "\n" in line_buf:
+                    line, line_buf = line_buf.split("\n", 1)
+                    buf += txt2png._clean_line(line) + " "
+
+                if eof and line_buf:
+                    buf += txt2png._clean_line(line_buf) + " "
+                    line_buf = ""
+
+                while len(buf) >= cpf:
+                    bl = len(buf)
+                    ft, buf = txt2png._consume_frame(buf, w, lpf)
+                    if not ft.strip():
+                        break
+                    cpf = max(w, bl - len(buf))
+                    emit(ft)
+
+            while buf.strip():
+                ft, buf = txt2png._consume_frame(buf, w, lpf)
+                if not ft.strip():
+                    break
+                emit(ft)
+        finally:
+            os.close(r_fd)
+
+        return captured.getvalue(), stored
+
+    def test_eof_flushes_partial_frame(self):
+        """Short input that doesn't fill a frame is emitted on EOF."""
+        stdout, stored = self._run_main_with_pipe("hello world\n")
+        self.assertEqual(1, len(stored))
+        self.assertIn("frame_0001.png", stored)
+        self.assertTrue(stored["frame_0001.png"].startswith(b"\x89PNG"))
+        self.assertIn("frame_0001.png", stdout)
+
+    def test_eof_no_trailing_newline(self):
+        """Input without trailing newline is still captured."""
+        stdout, stored = self._run_main_with_pipe("no newline at end")
+        self.assertEqual(1, len(stored))
+        self.assertIn("frame_0001.png", stored)
+
+    def test_eof_empty_input(self):
+        """Empty input produces no frames."""
+        stdout, stored = self._run_main_with_pipe("")
+        self.assertEqual(0, len(stored))
+
+    def test_eof_blank_lines_only(self):
+        """Only blank lines produce no frames (whitespace-only buffer)."""
+        stdout, stored = self._run_main_with_pipe("\n\n\n")
+        self.assertEqual(0, len(stored))
+
+    def test_eof_multiline_partial(self):
+        """Multiple lines that don't fill a frame are flushed as one on EOF."""
+        text = "line one\nline two\nline three\n"
+        stdout, stored = self._run_main_with_pipe(text)
+        self.assertEqual(1, len(stored))
+        self.assertTrue(stored["frame_0001.png"].startswith(b"\x89PNG"))
+
+    def test_timeout_flushes_stalled_stream(self):
+        """Data followed by a stall triggers a partial-frame flush."""
+        import select as _select
+
+        r_fd, w_fd = os.pipe()
+
+        font = txt2png._get_font()
+        w, lpf, lh = txt2png._calibrate(font)
+        stored = {}
+
+        def tracking_store(name, data):
+            txt2png._store_frame(name, data)
+            stored[name] = data
+
+        # Write some data, then let it stall (don't close write end yet)
+        os.write(w_fd, b"partial data before stall\n")
+
+        buf = ""
+        line_buf = ""
+        frame_num = 0
+        flushed = False
+
+        try:
+            for _ in range(15):
+                ready, _, _ = _select.select([r_fd], [], [], 0.1)
+                if ready:
+                    raw = os.read(r_fd, 8192)
+                    if not raw:
+                        break
+                    line_buf += raw.decode(errors="replace")
+                    while "\n" in line_buf:
+                        line, line_buf = line_buf.split("\n", 1)
+                        buf += txt2png._clean_line(line) + " "
+                else:
+                    if buf.strip():
+                        ft, buf = txt2png._consume_frame(buf, w, lpf)
+                        if ft.strip():
+                            frame_num += 1
+                            name = f"frame_{frame_num:04d}.png"
+                            data = txt2png._render_frame(
+                                ft, font, lh, w, lpf, frame_num, "…",
+                            )
+                            tracking_store(name, data)
+                            flushed = True
+                            break
+        finally:
+            os.close(w_fd)
+            os.close(r_fd)
+
+        self.assertTrue(flushed, "Timeout should have flushed partial frame")
+        self.assertIn("frame_0001.png", stored)
+        self.assertTrue(stored["frame_0001.png"].startswith(b"\x89PNG"))
+
+
 if __name__ == "__main__":
     unittest.main()
