@@ -4,23 +4,22 @@ txt2png
 Stream piped text (stdout) into 1568x1568 PNG frames and serve them over HTTP.
 
 Designed for dense context transfer to vision-capable LLMs: each frame is a
-monospace-rendered page at 20pt, the documented Claude vision maximum resolution,
-with no upscale penalty.  Based on
-[png_wrap.py](https://github.com/bogdando/opendev-agents/blob/master/src/rag_mcp/png_wrap.py)
-rendering parameters.
+monospace-rendered page at 19pt, the documented Claude vision maximum resolution,
+with no upscale penalty. 
 
 Architecture
 ------------
 
 ```
 ┌────────────┐        ┌──────────────────┐                    ┌───────────────┐       ┌─────────────────┐
-│            │        │                  │                    │               │       │   HTTP Server   │
-│ stdin pipe ├──read──► Text Buffer      ├─chars_per_frame───► PNG Renderer   ├─store─► In-memory dict  │
-│            │  lines │ (nl → space)     │   reached         │ (Pillow)      │ bytes │ {name: bytes}   │
+│            │        │                  │  _consume_frame    │               │       │  Persistent     │
+│ stdin pipe ├──read──► Text Buffer      ├─(wrap+slice N ln)──► PNG Renderer  ├─disk──► HTTP Server     │
+│            │  lines │ (nl → space)     │                    │ (Pillow)      │ write │ 127.0.0.1:42000 │
 └────────────┘        └──────────────────┘                    └───────┬───────┘       └────────┬────────┘
-                                                                      │                       │
-                                                                      │               127.0.0.1:42000
-                                                              print URL│
+                               ▲                                      │                       │
+                               │ re-adapt chars_per_frame             │            serves from FRAME_DIR
+                               │ from previous frame len      print URL│            (/tmp/txt2png)
+                               └──────────────────────────────────────┘
                                                                       ▼
                                                               ┌───────────────┐
                                                               │    stdout     │
@@ -35,38 +34,67 @@ Rendering parameters
 |-----------|-------|-----------|
 | Frame size | 1568x1568 | Claude vision maximum (no upscale penalty) |
 | Margin | 20px | Keeps text off frame edges |
-| Font size | 20pt | Balances density with reliable retrieval (22pt=100%, 16pt=17%) |
-| Line spacing | 3px | Tight but readable |
+| Font size | 19pt | Balances density with reliable retrieval (22pt=100%, 16pt=17%) |
+| Line spacing | 2px | Tight but readable |
 | Font | Monospace with fallback chain | DejaVu Sans Mono → Liberation Mono → SourceCodePro → default bitmap |
 | Background | White `(255,255,255)` | |
 | Text color | Black `(0,0,0)` | |
 | Footer | Gray `(128,128,128)`, centered | `— page N/M —` |
 | PNG encoding | `optimize=True` | Smaller file size |
 
-Adaptive calibration
---------------------
+Per-frame adaptive calibration
+-------------------------------
 
-On startup, before reading any stdin:
+On startup, font metrics are measured once to produce an initial estimate:
 
 1. Load the best available monospace font at 20pt
 2. Measure `line_height` via `font.getbbox("Ag")`
 3. Compute `wrap_width = usable_width / char_width` (monospace `"M"` bbox)
 4. Compute `lines_per_frame = usable_height / line_height`
-5. Derive `chars_per_frame = lines_per_frame * wrap_width`
+5. Derive initial `chars_per_frame = lines_per_frame * wrap_width`
 
-These metrics adapt to whatever font is actually found on the system.
-All subsequent frames use the same capacity.
+After each frame, `chars_per_frame` is re-adapted to the actual character
+count that filled the previous frame.  This compensates for word-boundary
+variations in `textwrap.wrap` — short words pack more characters per frame
+than long words, and the threshold tracks this automatically.
+
+The `_consume_frame()` function wraps a generous window of the buffer,
+takes exactly `lines_per_frame` wrapped lines, and returns the remainder.
+No text is ever clipped or lost to overflow.
+
+Persistent server
+-----------------
+
+The HTTP server runs as a detached background process that survives the
+main process exiting.  Frames are stored as PNG files on disk under
+`FRAME_DIR` (default `/tmp/txt2png`, override with `TXT2PNG_DIR` env var).
+
+On each invocation:
+
+1. Probe `127.0.0.1:42000` — if a server is already listening, reuse it
+2. Otherwise spawn a new detached server via `txt2png.py --serve`
+3. Write frames to disk starting from `frame_0001.png`, overwriting any
+   previous frames as it goes
+4. Print URLs to stdout and exit — frames and server remain available
+
+To stop the background server:
+
+```bash
+kill $(lsof -ti :42000)
+```
 
 Streaming pipeline
 ------------------
 
 - Main thread reads `sys.stdin` line-by-line (responsive for pipes)
 - Each line's trailing newline is replaced with a space, appended to a buffer
-- When `len(buffer) >= chars_per_frame`: slice off one frame's worth, render PNG,
-  store it, print `http://127.0.0.1:42000/frame_NNNN.png`
-- After EOF: render any remaining buffer as a final (partial) frame
+- When `len(buffer) >= chars_per_frame`:
+  - `_consume_frame()` wraps the buffer and extracts exactly `lines_per_frame` lines
+  - The frame is rendered to PNG, written to `FRAME_DIR`, and its URL is printed
+  - `chars_per_frame` is re-adapted to `len(frame_text)` for the next trigger
+- After EOF: drain any remaining buffer through `_consume_frame()` in a loop
 - After all frames emitted: patch footers with correct total page count,
-  print summary to stderr, block on `signal.pause()` keeping the server alive
+  print summary to stderr, exit (server persists)
 
 Usage
 -----
@@ -83,7 +111,15 @@ http://127.0.0.1:42000/frame_0002.png
 ...
 ```
 
-The server stays alive until Ctrl+C.
+The process exits after consuming stdin.  The server and frame files
+persist in the background — run the command again and frames are
+overwritten starting from `0001`.
+
+Override the frame directory:
+
+```bash
+TXT2PNG_DIR=/my/frames some_command | python3 txt2png.py
+```
 
 Installation
 ------------

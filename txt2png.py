@@ -2,28 +2,39 @@
 """Stream stdin text into 1568x1568 PNG frames served over HTTP.
 
 Reads piped stdout, replaces newlines with spaces, renders full frames
-as PNG images using Pillow, serves them on 127.0.0.1:42000, and prints
-only the frame URLs to stdout.  The frame capacity is calibrated once
-from the first available monospace font so layout adapts automatically.
+as PNG images using Pillow, serves them from disk via a persistent
+background server on 127.0.0.1:42000, and prints only the frame URLs
+to stdout.  Frame capacity re-adapts after every frame based on actual
+text consumption, so word-boundary variations never cause overflow or
+wasted space.
+
+The server survives process exit.  On the next invocation, the existing
+server is reused and frames are overwritten starting from 0001.
 """
 
 from __future__ import annotations
 
 import io
+import os
+import re
 import signal
+import socket
+import subprocess
 import sys
 import textwrap
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from PIL import Image, ImageDraw, ImageFont
 
 FRAME_SIZE = 1568
 MARGIN = 20
-FONT_SIZE = 20
-LINE_SPACING = 3
+FONT_SIZE = 19
+LINE_SPACING = 2
 HOST = "127.0.0.1"
 PORT = 42000
+FRAME_DIR = os.environ.get("TXT2PNG_DIR", "/tmp/txt2png")
 
 _USABLE = FRAME_SIZE - 2 * MARGIN
 
@@ -36,9 +47,14 @@ _FONT_CANDIDATES = [
     "/usr/share/fonts/adobe-source-code-pro/SourceCodePro-Regular.otf",
 ]
 
-# Shared frame store: frame name -> PNG bytes
-_frames: dict[str, bytes] = {}
-_frames_lock = threading.Lock()
+
+# CSI sequences (colors, cursor, erase) and OSC sequences (window title etc.)
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07')
+
+
+def _clean_line(line: str) -> str:
+    """Strip ANSI escape sequences and trailing whitespace from a line."""
+    return _ANSI_RE.sub("", line).rstrip()
 
 
 def _get_font() -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -60,6 +76,31 @@ def _calibrate(font):
     return wrap_width, lines_per_frame, line_h
 
 
+def _consume_frame(buf: str, wrap_width: int,
+                   lines_per_frame: int) -> tuple[str, str]:
+    """Wrap *buf* and extract exactly one frame's worth of lines.
+
+    Returns ``(frame_text, remaining_buf)`` where *frame_text* contains
+    newline-joined wrapped lines ready for rendering and *remaining_buf*
+    is the unconsumed tail reconstructed from leftover wrapped lines plus
+    any text beyond the working window.
+    """
+    window = lines_per_frame * (wrap_width + 1) * 2
+    candidate = buf[:window]
+    tail = buf[window:]
+
+    wrapped = textwrap.wrap(candidate, width=wrap_width, break_on_hyphens=False)
+    frame_lines = wrapped[:lines_per_frame]
+    rest_lines = wrapped[lines_per_frame:]
+
+    frame_text = "\n".join(frame_lines)
+    remaining = " ".join(rest_lines)
+    if tail:
+        remaining = (remaining + " " + tail) if remaining else tail
+
+    return frame_text, remaining
+
+
 def _render_frame(text: str, font, line_h: int, wrap_width: int,
                   lines_per_frame: int, page_num: int,
                   total_hint: str = "?") -> bytes:
@@ -69,7 +110,8 @@ def _render_frame(text: str, font, line_h: int, wrap_width: int,
         if not raw_line.strip():
             wrapped.append("")
         else:
-            wrapped.extend(textwrap.wrap(raw_line, width=wrap_width))
+            wrapped.extend(textwrap.wrap(raw_line, width=wrap_width,
+                                        break_on_hyphens=False))
 
     img = Image.new("RGB", (FRAME_SIZE, FRAME_SIZE), (255, 255, 255))
     draw = ImageDraw.Draw(img)
@@ -93,11 +135,30 @@ def _render_frame(text: str, font, line_h: int, wrap_width: int,
     return buf.getvalue()
 
 
+def _store_frame(name: str, data: bytes) -> None:
+    """Write a frame to disk atomically (temp-write + rename)."""
+    os.makedirs(FRAME_DIR, exist_ok=True)
+    fpath = os.path.join(FRAME_DIR, name)
+    tmp = fpath + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, fpath)
+
+
+def _load_frame(name: str) -> bytes | None:
+    """Read a frame from disk, or return None if missing."""
+    fpath = os.path.join(FRAME_DIR, name)
+    try:
+        with open(fpath, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         name = self.path.lstrip("/")
-        with _frames_lock:
-            data = _frames.get(name)
+        data = _load_frame(name)
         if data is None:
             self.send_response(404)
             self.end_headers()
@@ -113,11 +174,42 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _start_server(port: int = PORT) -> HTTPServer:
+    """Start an HTTP server in a daemon thread."""
     server = HTTPServer((HOST, port), _Handler)
     server.allow_reuse_address = True
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     return server
+
+
+def _is_server_running(port: int = PORT) -> bool:
+    """Probe whether a server is already listening."""
+    try:
+        with socket.create_connection((HOST, port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_server() -> None:
+    """Reuse the existing server or spawn a detached one."""
+    if _is_server_running():
+        print("[txt2png] reusing existing server", file=sys.stderr)
+        return
+    os.makedirs(FRAME_DIR, exist_ok=True)
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--serve"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _ in range(50):
+        if _is_server_running():
+            print("[txt2png] server started", file=sys.stderr)
+            return
+        time.sleep(0.1)
+    print("[txt2png] warning: server may not have started", file=sys.stderr)
 
 
 def main() -> None:
@@ -127,15 +219,15 @@ def main() -> None:
 
     font = _get_font()
     wrap_width, lines_per_frame, line_h = _calibrate(font)
-    chars_per_frame = lines_per_frame * wrap_width
+    chars_per_frame = int(lines_per_frame * wrap_width * 1.15)
 
     print(
         f"[txt2png] font loaded, {wrap_width} cols × {lines_per_frame} rows "
-        f"= {chars_per_frame} chars/frame",
+        f"~{chars_per_frame} chars/frame (adaptive)",
         file=sys.stderr,
     )
 
-    _start_server()
+    _ensure_server()
     base_url = f"http://{HOST}:{PORT}"
 
     buf = ""
@@ -149,32 +241,35 @@ def main() -> None:
             text, font, line_h, wrap_width, lines_per_frame,
             page_num=frame_num, total_hint="…",
         )
-        with _frames_lock:
-            _frames[name] = data
+        _store_frame(name, data)
         url = f"{base_url}/{name}"
         print(url, flush=True)
 
     for line in sys.stdin:
-        buf += line.rstrip("\n") + " "
+        buf += _clean_line(line) + " "
         while len(buf) >= chars_per_frame:
-            chunk = buf[:chars_per_frame]
-            buf = buf[chars_per_frame:]
-            emit_frame(chunk)
+            buf_len = len(buf)
+            frame_text, buf = _consume_frame(buf, wrap_width, lines_per_frame)
+            if not frame_text.strip():
+                break
+            # Re-adapt trigger using actual buffer bytes consumed, not
+            # len(frame_text) which is shorter (newlines vs spaces).
+            chars_per_frame = max(wrap_width, buf_len - len(buf))
+            emit_frame(frame_text)
 
-    if buf.strip():
-        emit_frame(buf)
+    while buf.strip():
+        frame_text, buf = _consume_frame(buf, wrap_width, lines_per_frame)
+        if not frame_text.strip():
+            break
+        emit_frame(frame_text)
 
     # Retroactively patch total page counts in all frames
     total = frame_num
     for idx in range(1, total + 1):
         name = f"frame_{idx:04d}.png"
-        with _frames_lock:
-            old = _frames.get(name)
+        old = _load_frame(name)
         if old is None:
             continue
-        # Re-render is the simplest way to fix the footer
-        # Recover text from the buffer isn't possible, so we patch in-place
-        # by overlaying just the footer area
         img = Image.open(io.BytesIO(old))
         draw = ImageDraw.Draw(img)
         footer_y = FRAME_SIZE - MARGIN - int(line_h)
@@ -192,21 +287,19 @@ def main() -> None:
         )
         buf2 = io.BytesIO()
         img.save(buf2, format="PNG", optimize=True)
-        with _frames_lock:
-            _frames[name] = buf2.getvalue()
+        _store_frame(name, buf2.getvalue())
 
     print(
-        f"\n[txt2png] {total} frame(s) served at {base_url}  "
-        f"(Ctrl+C to stop)",
+        f"[txt2png] {total} frame(s) at {base_url} "
+        f"(server persists in background)",
         file=sys.stderr,
     )
 
-    try:
-        signal.pause()
-    except AttributeError:
-        # Windows fallback
-        threading.Event().wait()
-
 
 if __name__ == "__main__":
-    main()
+    if "--serve" in sys.argv:
+        os.makedirs(FRAME_DIR, exist_ok=True)
+        _start_server()
+        signal.pause()
+    else:
+        main()
