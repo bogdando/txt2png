@@ -36,6 +36,7 @@ LINE_SPACING = 2
 HOST = "127.0.0.1"
 PORT = 42000
 FRAME_DIR = os.environ.get("TXT2PNG_DIR", "/tmp/txt2png")
+MAX_FRAMES = int(os.environ.get("TXT2PNG_MAX_FRAMES", "99"))
 
 _USABLE = FRAME_SIZE - 2 * MARGIN
 
@@ -239,7 +240,9 @@ def main() -> None:
     def emit_frame(text: str) -> None:
         nonlocal frame_num
         frame_num += 1
-        name = f"frame_{frame_num:04d}.png"
+        # Rotate back to 1 after MAX_FRAMES
+        slot = ((frame_num - 1) % MAX_FRAMES) + 1
+        name = f"frame_{slot:04d}.png"
         data = _render_frame(
             text, font, line_h, wrap_width, lines_per_frame,
             page_num=frame_num, total_hint="…",
@@ -293,10 +296,15 @@ def main() -> None:
             break
         emit_frame(frame_text)
 
-    # Retroactively patch total page counts in all frames
+    # Retroactively patch total page counts in stored frames
     total = frame_num
+    patched: set[str] = set()
     for idx in range(1, total + 1):
-        name = f"frame_{idx:04d}.png"
+        slot = ((idx - 1) % MAX_FRAMES) + 1
+        name = f"frame_{slot:04d}.png"
+        if name in patched:
+            continue
+        patched.add(name)
         old = _load_frame(name)
         if old is None:
             continue
@@ -321,7 +329,7 @@ def main() -> None:
 
     print(
         f"[txt2png] {total} frame(s) at {base_url} "
-        f"(server persists in background)",
+        f"(max {MAX_FRAMES} on disk, server persists in background)",
         file=sys.stderr,
     )
 

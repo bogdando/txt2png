@@ -72,6 +72,9 @@ class TestConstants(unittest.TestCase):
         self.assertEqual("127.0.0.1", txt2png.HOST)
         self.assertEqual(42000, txt2png.PORT)
 
+    def test_max_frames_default(self):
+        self.assertEqual(99, txt2png.MAX_FRAMES)
+
 
 class TestCleanLine(unittest.TestCase):
     """Verify ANSI stripping and whitespace trimming."""
@@ -320,6 +323,50 @@ class TestStoreAndLoad(_TmpDirMixin, unittest.TestCase):
         self.assertEqual([], errors)
         stored = [f for f in os.listdir(self.tmpdir) if f.endswith(".png")]
         self.assertEqual(20, len(stored))
+
+
+@unittest.skipUnless(HAS_PILLOW, "Pillow not installed")
+class TestFrameRotation(_TmpDirMixin, unittest.TestCase):
+    """Test frame slot rotation when MAX_FRAMES is exceeded."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_max = txt2png.MAX_FRAMES
+        txt2png.MAX_FRAMES = 9
+
+    def tearDown(self):
+        txt2png.MAX_FRAMES = self._orig_max
+        super().tearDown()
+
+    def test_10th_frame_overwrites_1st_slot(self):
+        font = txt2png._get_font()
+        w, lpf, lh = txt2png._calibrate(font)
+
+        for i in range(1, 11):
+            slot = ((i - 1) % txt2png.MAX_FRAMES) + 1
+            name = f"frame_{slot:04d}.png"
+            data = txt2png._render_frame(
+                f"content for frame {i}", font, lh, w, lpf, i, "…",
+            )
+            txt2png._store_frame(name, data)
+
+        # Only 9 files on disk (slots 1-9)
+        files = sorted(f for f in os.listdir(self.tmpdir) if f.endswith(".png"))
+        self.assertEqual(9, len(files))
+        self.assertEqual("frame_0001.png", files[0])
+        self.assertEqual("frame_0009.png", files[-1])
+
+        # Slot 1 now holds frame 10's content (overwritten)
+        data = txt2png._load_frame("frame_0001.png")
+        self.assertIsNotNone(data)
+        self.assertTrue(data.startswith(b"\x89PNG"))
+
+    def test_slot_formula(self):
+        txt2png.MAX_FRAMES = 9
+        expected = [1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 3]
+        for i, want in enumerate(expected, start=1):
+            slot = ((i - 1) % txt2png.MAX_FRAMES) + 1
+            self.assertEqual(want, slot, f"frame_num={i}")
 
 
 @unittest.skipUnless(HAS_PILLOW, "Pillow not installed")

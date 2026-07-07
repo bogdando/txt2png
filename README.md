@@ -75,7 +75,9 @@ On each invocation:
 2. Otherwise spawn a new detached server via `txt2png.py --serve`
 3. Write frames to disk starting from `frame_0001.png`, overwriting any
    previous frames as it goes
-4. Print URLs to stdout and exit — frames and server remain available
+4. After `TXT2PNG_MAX_FRAMES` (default 99), frame slots rotate back to
+   `frame_0001.png`
+5. Print URLs to stdout and exit — frames and server remain available
 
 To stop the background server:
 
@@ -86,15 +88,18 @@ kill $(lsof -ti :42000)
 Streaming pipeline
 ------------------
 
-- Main thread reads `sys.stdin` line-by-line (responsive for pipes)
-- Each line's trailing newline is replaced with a space, appended to a buffer
+- Main thread reads `sys.stdin` via `select` + `os.read` (non-blocking)
+- ANSI escape sequences are stripped; trailing whitespace is trimmed;
+  consecutive spaces are collapsed
 - When `len(buffer) >= chars_per_frame`:
   - `_consume_frame()` wraps the buffer and extracts exactly `lines_per_frame` lines
   - The frame is rendered to PNG, written to `FRAME_DIR`, and its URL is printed
-  - `chars_per_frame` is re-adapted to `len(frame_text)` for the next trigger
+  - `chars_per_frame` is re-adapted from actual buffer consumption
+- If no data arrives for 5 seconds, any buffered text is flushed as a partial frame
 - After EOF: drain any remaining buffer through `_consume_frame()` in a loop
 - After all frames emitted: patch footers with correct total page count,
   print summary to stderr, exit (server persists)
+- Frame slots rotate: frame 100 overwrites slot 1, 101 overwrites slot 2, etc.
 
 Usage
 -----
@@ -115,11 +120,17 @@ The process exits after consuming stdin.  The server and frame files
 persist in the background — run the command again and frames are
 overwritten starting from `0001`.
 
-Override the frame directory:
+Environment variables:
 
 ```bash
 TXT2PNG_DIR=/my/frames some_command | python3 txt2png.py
+TXT2PNG_MAX_FRAMES=50 some_command | python3 txt2png.py
 ```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TXT2PNG_DIR` | `/tmp/txt2png` | Directory for frame PNG files |
+| `TXT2PNG_MAX_FRAMES` | `99` | Max frame slots on disk; after this, slots rotate back to 1 |
 
 Installation
 ------------
