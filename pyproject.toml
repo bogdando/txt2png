@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "txt2png"
+version = "0.1.0"
+description = "Stream stdin text into PNG frames served over HTTP"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+txt2png = "txt2png:main"
+
+[tool.ruff]
+line-length = 99
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
